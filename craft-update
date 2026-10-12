@@ -1,0 +1,414 @@
+#!/bin/bash
+# craft-update — auto-updater for PdfCraft and PhotoCraft (github.com/storytold).
+#
+# Upstream only offers "Help ▸ Check for updates", which opens the release page,
+# so this script does the rest: it asks GitHub for the newest release, downloads
+# the official macOS universal DMG, checks its SHA-256 digest, the Developer ID
+# signature (pinned to the upstream Team ID) and notarization, then swaps the
+# app in /Applications. If the app is open, the verified update is staged and
+# installed on a later run, after you quit it. The previous version is kept as
+# a backup so it can be rolled back.
+#
+# Usage: craft-update [run|check|status|rollback <App>]
+#   run       check, download and install (default; the LaunchAgent runs this)
+#   check     only compare installed and latest versions
+#   status    show staged updates, backups and the recent log
+#   rollback  put the previous version back and skip the current release
+
+set -u
+umask 022
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export LC_ALL=C
+
+# name|GitHub repo|asset prefix|bundle id
+APPS="PdfCraft|storytold/pdfcraft|pdfcraft|ai.storyteller.pdfcraft
+PhotoCraft|storytold/photocraft|photocraft|ai.storyteller.photocraft"
+TEAM_ID=DJ6XS33FX8 # Learning Machines LLC, signer of the official builds
+
+APPS_DIR=${CRAFT_UPDATE_APPS_DIR:-/Applications}
+STATE=${CRAFT_UPDATE_STATE:-"$HOME/Library/Application Support/craft-update"}
+LOG=${CRAFT_UPDATE_LOG:-"$HOME/Library/Logs/craft-update.log"}
+AGENT=com.local.craft-update
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+
+log() {
+	local line
+	line="$(date '+%Y-%m-%d %H:%M:%S') $*"
+	echo "$line" >>"$LOG"
+	if [ -t 1 ]; then echo "$line"; fi
+}
+
+notify() {
+	osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1 || true
+}
+
+app_version() {
+	plutil -extract CFBundleShortVersionString raw -o - "$1/Contents/Info.plist" 2>/dev/null
+}
+
+is_running() {
+	pgrep -x "$1" >/dev/null 2>&1
+}
+
+# ver_gt A B: true if version A is newer than B (numeric x.y.z).
+ver_gt() {
+	local IFS=. i
+	local -a a b
+	a=($1)
+	b=($2)
+	for i in 0 1 2; do
+		if ((10#${a[i]:-0} > 10#${b[i]:-0})); then return 0; fi
+		if ((10#${a[i]:-0} < 10#${b[i]:-0})); then return 1; fi
+	done
+	return 1
+}
+
+app_field() { # name field-number
+	echo "$APPS" | awk -F'|' -v n="$1" -v f="$2" '$1 == n { print $f }'
+}
+
+# --- locking and cleanup -----------------------------------------------------
+
+cleanup() {
+	local m
+	for m in "$STATE"/*/mnt; do
+		if mount | grep -qF " on $m ("; then hdiutil detach "$m" -force -quiet; fi
+	done
+	rm -rf "$STATE/.lock"
+}
+
+lock() {
+	mkdir -p "$STATE" "$(dirname "$LOG")"
+	if ! mkdir "$STATE/.lock" 2>/dev/null; then
+		local pid
+		pid=$(cat "$STATE/.lock/pid" 2>/dev/null)
+		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+			log "another run is in progress (pid $pid)"
+			exit 0
+		fi
+		rm -rf "$STATE/.lock"
+		mkdir "$STATE/.lock" || exit 1
+	fi
+	echo $$ >"$STATE/.lock/pid"
+	trap cleanup EXIT
+	trap 'exit 1' INT TERM HUP
+}
+
+trim_log() {
+	if [ -f "$LOG" ] && [ "$(stat -f %z "$LOG")" -gt 524288 ]; then
+		tail -n 2000 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+	fi
+}
+
+# --- GitHub ------------------------------------------------------------------
+
+# Fetch the repo's recent releases into $dir/releases.json. Uses the ETag from
+# the last fetch, so unchanged answers come back as 304 and don't use up the
+# 60-requests-per-hour anonymous rate limit.
+fetch_releases() { # repo dir
+	local repo=$1 dir=$2 code
+	local -a hdr=()
+	if [ -s "$dir/releases.etag" ] && [ -s "$dir/releases.json" ]; then
+		hdr=(-H "If-None-Match: $(cat "$dir/releases.etag")")
+	fi
+	code=$(curl -sS -L --connect-timeout 15 --max-time 60 --retry 2 \
+		-A craft-update -H 'Accept: application/vnd.github+json' \
+		-H 'X-GitHub-Api-Version: 2022-11-28' ${hdr[@]+"${hdr[@]}"} \
+		-D "$dir/headers.tmp" -o "$dir/releases.tmp" -w '%{http_code}' \
+		"https://api.github.com/repos/$repo/releases?per_page=15" 2>>"$LOG")
+	case $code in
+	200)
+		mv "$dir/releases.tmp" "$dir/releases.json"
+		tr -d '\r' <"$dir/headers.tmp" | sed -n 's/^[Ee][Tt][Aa][Gg]: *//p' | tail -n 1 >"$dir/releases.etag"
+		;;
+	304) ;;
+	*)
+		log "$repo: GitHub API request failed (HTTP ${code:-none})"
+		rm -f "$dir/releases.tmp" "$dir/headers.tmp"
+		return 1
+		;;
+	esac
+	rm -f "$dir/releases.tmp" "$dir/headers.tmp"
+}
+
+# Print "version|url|digest" of the newest stable macOS DMG among the fetched
+# releases. Matching on the asset name skips other products that share the repo
+# (storytold/pdfcraft also publishes PrintCraft releases).
+latest_asset() { # json prefix
+	jq -r --arg p "$2" '
+		[ .[] | select((.draft or .prerelease) | not) | .assets[]
+		  | select(.name | test("^" + $p + "-[0-9]+\\.[0-9]+\\.[0-9]+-macos-universal\\.dmg$"))
+		  | . + {ver: (.name | capture("-(?<v>[0-9]+\\.[0-9]+\\.[0-9]+)-").v)} ]
+		| sort_by(.ver | split(".") | map(tonumber)) | last
+		| select(. != null) | [.ver, .browser_download_url, (.digest // "")] | join("|")' "$1"
+}
+
+# --- verify, stage, install --------------------------------------------------
+
+verify_app() { # name bundle-id version path
+	local req="=anchor apple generic and identifier \"$2\" and certificate leaf[subject.OU] = \"$TEAM_ID\""
+	if ! codesign --verify --deep --strict -R "$req" "$4" 2>>"$LOG"; then
+		log "$1: signature check FAILED for $4"
+		return 1
+	fi
+	if ! spctl --assess --type execute "$4" 2>>"$LOG"; then
+		log "$1: Gatekeeper/notarization check FAILED for $4"
+		return 1
+	fi
+	local v
+	v=$(app_version "$4")
+	if [ "$v" != "$3" ]; then
+		log "$1: bundle says version $v, expected $3"
+		return 1
+	fi
+}
+
+stage_update() { # name bundle-id version url digest dir
+	local name=$1 bundle=$2 ver=$3 url=$4 digest=$5 dir=$6
+	local dmg="$dir/download.dmg" mnt="$dir/mnt" tmp="$dir/staging" got ok=0
+	rm -rf "$tmp" "$dmg" "$dmg.part"
+	mkdir -p "$tmp" "$mnt"
+
+	log "$name: downloading $ver"
+	if ! curl -fsSL --connect-timeout 20 --max-time 3600 --retry 3 -A craft-update \
+		-o "$dmg.part" "$url" 2>>"$LOG"; then
+		log "$name: download failed"
+		rm -f "$dmg.part"
+		return 1
+	fi
+	if [ -n "$digest" ]; then
+		got="sha256:$(shasum -a 256 "$dmg.part" | cut -d' ' -f1)"
+		if [ "$got" != "$digest" ]; then
+			log "$name: checksum mismatch (got $got, release says $digest)"
+			rm -f "$dmg.part"
+			return 1
+		fi
+	else
+		log "$name: release lists no digest; relying on the code signature"
+	fi
+	mv "$dmg.part" "$dmg"
+
+	# `diskutil image` replaces the deprecated `hdiutil attach` on macOS 27+.
+	if ! diskutil image attach --readOnly --nobrowse --mountPoint "$mnt" "$dmg" \
+		</dev/null >/dev/null 2>&1 &&
+		! hdiutil attach -nobrowse -readonly -noautoopen -noverify \
+			-mountpoint "$mnt" "$dmg" </dev/null >/dev/null 2>>"$LOG"; then
+		log "$name: could not mount the dmg"
+		rm -f "$dmg"
+		return 1
+	fi
+	if [ -d "$mnt/$name.app" ]; then
+		ditto "$mnt/$name.app" "$tmp/$name.app" 2>>"$LOG" && ok=1
+	else
+		log "$name: $name.app not found in the dmg"
+	fi
+	hdiutil detach "$mnt" -quiet 2>/dev/null || hdiutil detach "$mnt" -force -quiet
+	rm -f "$dmg"
+	if [ $ok != 1 ]; then
+		rm -rf "$tmp"
+		return 1
+	fi
+
+	# Finder info and other xattrs aren't part of the signature but make
+	# `codesign --strict` fail, so drop them from our copy.
+	xattr -cr "$tmp/$name.app"
+	if ! verify_app "$name" "$bundle" "$ver" "$tmp/$name.app"; then
+		rm -rf "$tmp"
+		return 1
+	fi
+	rm -rf "$dir/staged"
+	mv "$tmp" "$dir/staged"
+	echo "$ver" >"$dir/staged/version"
+	log "$name: $ver verified and staged"
+}
+
+# Remove the previous backup. macOS may refuse to delete a protected app
+# bundle, in which case it goes to the Trash instead.
+drop_backup() { # dir
+	local b="$1/backup"
+	[ -e "$b" ] || return 0
+	rm -rf "$b" 2>/dev/null && return 0
+	mv "$b" "$HOME/.Trash/craft-update backup $(date +%Y%m%d-%H%M%S)" 2>/dev/null && return 0
+	log "warning: could not remove old backup $b"
+	return 1
+}
+
+install_staged() { # name bundle-id dir
+	local name=$1 bundle=$2 dir=$3
+	local new="$dir/staged/$name.app" dest="$APPS_DIR/$name.app" ver old_ver=""
+	ver=$(cat "$dir/staged/version")
+
+	if is_running "$name"; then
+		if [ "$(cat "$dir/notified" 2>/dev/null)" != "$ver" ]; then
+			notify "$name $ver 已准备好" "退出 $name 后会自动安装新版本"
+			echo "$ver" >"$dir/notified"
+		fi
+		log "$name: app is open; $ver stays staged until it quits"
+		return 0
+	fi
+
+	# The staged copy may have waited a while; check it again before use.
+	if ! verify_app "$name" "$bundle" "$ver" "$new"; then
+		rm -rf "$dir/staged"
+		return 1
+	fi
+	if [ -d "$dest" ]; then
+		old_ver=$(app_version "$dest")
+		if ! drop_backup "$dir"; then
+			log "$name: skipping install, old backup is in the way"
+			return 1
+		fi
+		mkdir "$dir/backup"
+		if ! mv "$dest" "$dir/backup/$name.app"; then
+			log "$name: could not move the current app out of $APPS_DIR"
+			return 1
+		fi
+		echo "$old_ver" >"$dir/backup/version"
+	fi
+	if [ -e "$dest" ] || ! mv "$new" "$dest"; then
+		log "$name: install failed, restoring $old_ver"
+		if [ -n "$old_ver" ] && [ ! -e "$dest" ]; then mv "$dir/backup/$name.app" "$dest"; fi
+		return 1
+	fi
+	rm -rf "$dir/staged" "$dir/notified"
+	"$LSREGISTER" -f "$dest" >/dev/null 2>&1 || true
+	log "$name: updated ${old_ver:-(none)} -> $ver"
+	notify "$name 已更新到 $ver" "${old_ver:+旧版本 $old_ver 已备份，可用 craft-update rollback $name 还原}"
+}
+
+update_one() { # name repo prefix bundle-id
+	local name=$1 repo=$2 prefix=$3 bundle=$4
+	local dir="$STATE/$name" dest="$APPS_DIR/$name.app" installed info ver url digest
+	mkdir -p "$dir"
+	if [ ! -d "$dest" ]; then
+		log "$name: not installed in $APPS_DIR, skipping"
+		return 0
+	fi
+	installed=$(app_version "$dest")
+	fetch_releases "$repo" "$dir" || return 1
+	info=$(latest_asset "$dir/releases.json" "$prefix")
+	if [ -z "$info" ]; then
+		log "$name: no macOS release found in $repo"
+		return 1
+	fi
+	IFS='|' read -r ver url digest <<<"$info"
+
+	if ! ver_gt "$ver" "$installed"; then
+		rm -rf "$dir/staged" "$dir/notified"
+		log "$name: $installed is up to date"
+		return 0
+	fi
+	if [ "$(cat "$dir/skip" 2>/dev/null)" = "$ver" ]; then
+		log "$name: $ver was rolled back, waiting for a newer release"
+		return 0
+	fi
+	if [ "$(cat "$dir/staged/version" 2>/dev/null)" != "$ver" ]; then
+		stage_update "$name" "$bundle" "$ver" "$url" "$digest" "$dir" || return 1
+	fi
+	install_staged "$name" "$bundle" "$dir"
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd_run() {
+	lock
+	trim_log
+	local name repo prefix bundle rc=0
+	while IFS='|' read -r name repo prefix bundle; do
+		update_one "$name" "$repo" "$prefix" "$bundle" || rc=1
+	done <<<"$APPS"
+	return $rc
+}
+
+cmd_check() {
+	mkdir -p "$STATE"
+	local name repo prefix bundle dir installed latest staged
+	while IFS='|' read -r name repo prefix bundle; do
+		dir="$STATE/$name"
+		mkdir -p "$dir"
+		installed=$(app_version "$APPS_DIR/$name.app")
+		latest="?"
+		if fetch_releases "$repo" "$dir"; then
+			latest=$(latest_asset "$dir/releases.json" "$prefix" | cut -d'|' -f1)
+		fi
+		staged=$(cat "$dir/staged/version" 2>/dev/null)
+		printf '%-11s installed %-8s latest %-8s' "$name" "${installed:--}" "${latest:-?}"
+		if [ -z "$installed" ]; then
+			echo "  (not installed)"
+		elif [ "$latest" != "?" ] && ver_gt "$latest" "$installed"; then
+			echo "  update available${staged:+ (staged $staged)}"
+		else
+			echo "  up to date"
+		fi
+	done <<<"$APPS"
+}
+
+cmd_status() {
+	local name repo prefix bundle dir
+	while IFS='|' read -r name repo prefix bundle; do
+		dir="$STATE/$name"
+		printf '%-11s installed %-8s staged %-8s backup %-8s skip %s\n' "$name" \
+			"$(app_version "$APPS_DIR/$name.app")" \
+			"$(cat "$dir/staged/version" 2>/dev/null || echo -)" \
+			"$(cat "$dir/backup/version" 2>/dev/null || echo -)" \
+			"$(cat "$dir/skip" 2>/dev/null || echo -)"
+	done <<<"$APPS"
+	echo
+	if launchctl print "gui/$(id -u)/$AGENT" >/dev/null 2>&1; then
+		echo "LaunchAgent $AGENT: loaded"
+	else
+		echo "LaunchAgent $AGENT: NOT loaded"
+	fi
+	echo "Log: $LOG"
+	if [ -f "$LOG" ]; then tail -n 12 "$LOG"; fi
+}
+
+cmd_rollback() { # name
+	local name=${1:-} dir dest cur prev
+	if [ -z "$name" ] || [ -z "$(app_field "$name" 1)" ]; then
+		echo "usage: craft-update rollback <$(echo "$APPS" | cut -d'|' -f1 | paste -sd'|' -)>" >&2
+		return 2
+	fi
+	lock
+	dir="$STATE/$name"
+	dest="$APPS_DIR/$name.app"
+	if [ ! -d "$dir/backup/$name.app" ]; then
+		echo "$name: no backup to roll back to" >&2
+		return 1
+	fi
+	if is_running "$name"; then
+		echo "$name is open; quit it first" >&2
+		return 1
+	fi
+	cur=$(app_version "$dest")
+	prev=$(cat "$dir/backup/version")
+	if [ -e "$dest" ]; then
+		rm -rf "$dir/rolled-back"
+		mv "$dest" "$dir/rolled-back" || return 1
+	fi
+	mv "$dir/backup/$name.app" "$dest" || return 1
+	rm -rf "$dir/backup" "$dir/staged"
+	rm -rf "$dir/rolled-back" 2>/dev/null ||
+		mv "$dir/rolled-back" "$HOME/.Trash/$name $cur (rolled back)" 2>/dev/null
+	[ -n "$cur" ] && echo "$cur" >"$dir/skip"
+	"$LSREGISTER" -f "$dest" >/dev/null 2>&1 || true
+	log "$name: rolled back $cur -> $prev; $cur will be skipped"
+}
+
+main() {
+	case ${1:-run} in
+	run) cmd_run ;;
+	check) cmd_check ;;
+	status) cmd_status ;;
+	rollback) cmd_rollback "${2:-}" ;;
+	-h | --help | help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0" ;;
+	*)
+		echo "unknown command: $1 (try --help)" >&2
+		return 2
+		;;
+	esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	main "$@"
+fi
