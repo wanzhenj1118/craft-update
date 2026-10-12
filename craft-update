@@ -1,5 +1,5 @@
 #!/bin/bash
-# craft-update — auto-updater for PdfCraft and PhotoCraft (github.com/storytold).
+# craft-update — auto-updater for PdfCraft, PhotoCraft and WordCraft (github.com/storytold).
 #
 # Upstream only offers "Help ▸ Check for updates", which opens the release page,
 # so this script does the rest: it asks GitHub for the newest release, downloads
@@ -22,7 +22,8 @@ export LC_ALL=C
 
 # name|GitHub repo|asset prefix|bundle id
 APPS="PdfCraft|storytold/pdfcraft|pdfcraft|ai.storyteller.pdfcraft
-PhotoCraft|storytold/photocraft|photocraft|ai.storyteller.photocraft"
+PhotoCraft|storytold/photocraft|photocraft|ai.storyteller.photocraft
+WordCraft|storytold/wordcraft|wordcraft|ai.storyteller.wordcraft"
 TEAM_ID=DJ6XS33FX8 # Learning Machines LLC, signer of the official builds
 
 APPS_DIR=${CRAFT_UPDATE_APPS_DIR:-/Applications}

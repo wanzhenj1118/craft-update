@@ -1,6 +1,8 @@
 # craft-update
 
-给 macOS 上的 [PdfCraft](https://github.com/storytold/pdfcraft) 和 [PhotoCraft](https://github.com/storytold/photocraft) 用的自动更新器。
+给 macOS 上的 [PdfCraft](https://github.com/storytold/pdfcraft)、[PhotoCraft](https://github.com/storytold/photocraft) 和 [WordCraft](https://github.com/storytold/wordcraft) 用的自动更新器。
+
+要加 storytold 的其他 app，在脚本开头的 `APPS` 里加一行 `名字|仓库|资源前缀|bundle id` 即可（前提是同样发布 `<前缀>-X.Y.Z-macos-universal.dmg`、由同一个 Team ID 签名）。
 
 上游只提供 Help ▸ Check for updates（打开下载页），明确不做自动安装（见 [storytold/pdfcraft#28](https://github.com/storytold/pdfcraft/issues/28)）。这个脚本在 app 外面补上这一步：
 
